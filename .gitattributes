@@ -1,0 +1,8 @@
+# Скрипты и словари должны приезжать с LF: .command не запустится с CRLF,
+# а по words_*.txt идёт бинарный поиск, который рассчитывает на \n.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+words_ru.txt -text
+words_en.txt -text
+*.gif binary
