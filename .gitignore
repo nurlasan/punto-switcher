@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 run.log
 *.log
+settings.json
+build/
+dist/

@@ -15,7 +15,7 @@ import os
 import re
 import sys
 
-from layouts import DICT, KNOWN, NEVER, HERE
+from layouts import DICT, KNOWN, NEVER, HERE, user_file
 
 WORD_RE = re.compile(r"[А-Яа-яЁё]{3,}|[A-Za-z]{3,}")
 EXTS = {".md", ".txt", ".py", ".c", ".h", ".cpp", ".js", ".ts", ".json",
@@ -81,7 +81,7 @@ def main(argv):
             continue
         fresh.add(word)
 
-    path = os.path.join(HERE, "dict_user.txt")
+    path = user_file("dict_user.txt")
     existing = [line.rstrip("\n") for line in io.open(path, encoding="utf-8")] if os.path.exists(path) else []
     with io.open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(existing + sorted(fresh)) + "\n")

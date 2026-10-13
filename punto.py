@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Переключатель раскладки в духе Punto Switcher (RU <-> EN), Windows.
+Tilashar - переключатель раскладки в духе Punto Switcher (RU <-> EN), Windows.
 
 Горячие клавиши:
     Pause/Break        - перевести последнее набранное слово в другую раскладку
@@ -9,17 +9,22 @@
     Ctrl+Pause         - вкл/выкл автоматический режим
     Ctrl+Shift+Pause   - выход
 
-Зависимостей нет, только ctypes. Запуск: py punto.py (или punto.bat - без консоли).
+Зависимостей нет, только ctypes. Запуск: py punto.py (или punto.bat - без консоли),
+либо Tilashar.exe (собирается build-exe.bat), который умеет обновляться с GitHub.
 """
 
 import ctypes
 import ctypes.wintypes as w
 import os
 import sys
+import threading
 import time
+import winreg
 
 import core
-from layouts import detect_direction, RU_LCID, EN_LCID
+import updater
+from version import VERSION
+from layouts import detect_direction, HERE, RU_LCID, EN_LCID
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -33,12 +38,17 @@ LRESULT = ctypes.c_longlong if IS64 else ctypes.c_long
 
 WH_KEYBOARD_LL, WH_MOUSE_LL = 13, 14
 WM_KEYDOWN, WM_SYSKEYDOWN = 0x0100, 0x0104
+WM_KEYUP, WM_SYSKEYUP = 0x0101, 0x0105
 WM_LBUTTONDOWN, WM_RBUTTONDOWN = 0x0201, 0x0204
 WM_DESTROY, WM_COMMAND, WM_HOTKEY = 0x0002, 0x0111, 0x0312
 WM_INPUTLANGCHANGEREQUEST = 0x0050
 WM_RBUTTONUP, WM_LBUTTONDBLCLK = 0x0205, 0x0203
 WM_TRAY = 0x0400 + 1
 WM_AUTOFIX = 0x0400 + 2   # «проверь последнее слово» - из хука в главный поток
+WM_CONVERT = 0x0400 + 3   # «переведи последнее слово» - двойной Ctrl/Alt/Shift
+WM_UPDATE = 0x0400 + 4    # проверка обновлений: wparam=1 - начать, 0 - готов результат
+WM_UPDATE_READY = 0x0400 + 5   # новый exe скачан, пора перезапускаться
+WM_CLOSE = 0x0010
 
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP, KEYEVENTF_UNICODE = 0x0002, 0x0004
@@ -47,6 +57,12 @@ LLKHF_INJECTED = 0x10
 MOD_ALT, MOD_CONTROL, MOD_SHIFT = 0x0001, 0x0002, 0x0004
 VK_BACK, VK_SHIFT, VK_CONTROL, VK_MENU, VK_CAPITAL, VK_PAUSE = 0x08, 0x10, 0x11, 0x12, 0x14, 0x13
 VK_LWIN, VK_RWIN, VK_C, VK_V = 0x5B, 0x5C, 0x43, 0x56
+
+# модификаторы для двойного нажатия: хук видит левые/правые коды
+MOD_KEYS = {VK_SHIFT: "shift", 0xA0: "shift", 0xA1: "shift",
+            VK_CONTROL: "ctrl", 0xA2: "ctrl", 0xA3: "ctrl",
+            VK_MENU: "alt", 0xA4: "alt", 0xA5: "alt"}
+HELD = set()          # модификаторы, которые сейчас зажаты
 
 # PUNTO_TEST=1 - учитывать синтетический ввод (нужно для автотестов)
 ALLOW_INJECTED = os.environ.get("PUNTO_TEST") == "1"
@@ -122,6 +138,8 @@ user32.CreateWindowExW.argtypes = [w.DWORD, w.LPCWSTR, w.LPCWSTR, w.DWORD,
 user32.CreateWindowExW.restype = w.HWND
 user32.LoadIconW.argtypes = [w.HINSTANCE, w.LPCWSTR]
 user32.LoadIconW.restype = w.HANDLE
+user32.LoadImageW.argtypes = [w.HINSTANCE, w.LPCWSTR, w.UINT, ctypes.c_int, ctypes.c_int, w.UINT]
+user32.LoadImageW.restype = w.HANDLE
 user32.CreatePopupMenu.restype = w.HMENU
 user32.AppendMenuW.argtypes = [w.HMENU, w.UINT, ctypes.c_void_p, w.LPCWSTR]
 user32.TrackPopupMenu.argtypes = [w.HMENU, w.UINT, ctypes.c_int, ctypes.c_int,
@@ -136,6 +154,10 @@ user32.GetClipboardData.restype = w.HANDLE
 user32.SetClipboardData.argtypes = [w.UINT, w.HANDLE]
 user32.SetClipboardData.restype = w.HANDLE
 user32.OpenClipboard.argtypes = [w.HWND]
+user32.MessageBoxW.argtypes = [w.HWND, w.LPCWSTR, w.LPCWSTR, w.UINT]
+user32.FindWindowW.argtypes = [w.LPCWSTR, w.LPCWSTR]
+user32.FindWindowW.restype = w.HWND
+user32.IsWindow.argtypes = [w.HWND]
 kernel32.GetModuleHandleW.argtypes = [w.LPCWSTR]
 kernel32.GetModuleHandleW.restype = w.HMODULE
 kernel32.GlobalAlloc.argtypes = [w.UINT, ctypes.c_size_t]
@@ -316,9 +338,43 @@ def vk_to_char(vk, scan, hkl):
     return ch if ch.isprintable() or ch.isspace() else ""
 
 
-def on_key(vk, scan, flags):
-    """Разбор нажатия из хука; тяжёлую проверку откладываем в главный поток."""
+def on_modifier_key(vk, up):
+    """Ctrl/Alt/Shift: считаем только нажатие без других модификаторов и без автоповтора.
+
+    Возвращает True, если событие надо съесть (отпускание Alt, см. ниже).
+    """
+    if up:
+        HELD.discard(vk)
+        if not SW.on_modifier_up(MOD_KEYS[vk]) or not MAIN_HWND[0]:
+            return False
+        user32.PostMessageW(MAIN_HWND[0], WM_CONVERT, 0, 0)
+        if MOD_KEYS[vk] != "alt":
+            return False
+        # одиночный Alt открыл бы строку меню окна. Съедаем настоящее отпускание
+        # и посылаем Ctrl + отпускание Alt: система видит сочетание, меню молчит
+        send_inputs([_key(VK_CONTROL), _key(VK_CONTROL, True), _key(vk, True)])
+        return True
+    if vk in HELD:                         # автоповтор зажатой клавиши
+        return False
+    # отпускание могло потеряться (Win+L и т.п.) - сверяемся с системой
+    HELD.intersection_update({k for k in HELD if user32.GetAsyncKeyState(k) & 0x8000})
+    alone = not HELD
+    HELD.add(vk)
+    if SW.on_modifier(MOD_KEYS[vk] if alone else None) and MAIN_HWND[0]:
+        user32.PostMessageW(MAIN_HWND[0], WM_CONVERT, 0, 0)
+    return False
+
+
+def on_key(vk, scan, flags, up=False):
+    """Разбор нажатия из хука; тяжёлую проверку откладываем в главный поток.
+
+    True - событие съесть, дальше не передавать.
+    """
     if SW.injecting or (flags & LLKHF_INJECTED and not ALLOW_INJECTED):
+        return False
+    if vk in MOD_KEYS:
+        return on_modifier_key(vk, up)
+    if up:
         return
     if vk in RESET_KEYS:
         SW.reset()
@@ -343,10 +399,11 @@ MAIN_HWND = [None]   # hwnd служебного окна; заполняетс�
 
 @HOOKPROC
 def keyboard_proc(code, wparam, lparam):
-    if code == 0 and wparam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+    if code == 0 and wparam in (WM_KEYDOWN, WM_SYSKEYDOWN, WM_KEYUP, WM_SYSKEYUP):
         kb = ctypes.cast(lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
         try:
-            on_key(kb.vkCode, kb.scanCode, kb.flags)
+            if on_key(kb.vkCode, kb.scanCode, kb.flags, wparam in (WM_KEYUP, WM_SYSKEYUP)):
+                return 1
         except Exception:
             pass
     return user32.CallNextHookEx(None, code, wparam, lparam)
@@ -364,17 +421,166 @@ def mouse_proc(code, wparam, lparam):
 NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
 NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x01, 0x02, 0x04
 IDI_APPLICATION = 32512
-MF_STRING, MF_SEPARATOR, MF_CHECKED = 0x0000, 0x0800, 0x0008
+MF_STRING, MF_SEPARATOR, MF_CHECKED, MF_POPUP, MF_GRAYED = 0x0000, 0x0800, 0x0008, 0x0010, 0x0001
 TPM_RIGHTBUTTON = 0x0002
 
 ID_AUTO, ID_SPELL, ID_EXIT = 1001, 1003, 1002
+ID_AUTOUPDATE, ID_CHECKUPDATE, ID_AUTOSTART = 1004, 1005, 1006
+ID_TRIGGER = 1100     # + номер в core.TRIGGERS
+DEFAULT_TRIGGER = "ctrl"   # пока в меню ничего не выбрано
+ID_TAPS = 1200        # + число нажатий
+TRIGGER_NAMES = {"ctrl": "Ctrl", "alt": "Alt", "shift": "Shift",
+                 "space": "Пробел", "off": "Выключено"}
+TAPS_NAMES = {1: "1 - одно нажатие", 2: "2 - два нажатия"}
+
+
+def trigger_title():
+    if SW.trigger == "off":
+        return "Перевод слова: выключен"
+    return f"Перевод слова: {SW.taps}× {TRIGGER_NAMES[SW.trigger]}"
 HK_WORD, HK_SEL, HK_AUTO, HK_EXIT, HK_SPELL = 1, 2, 3, 4, 5
 
 nid = NOTIFYICONDATA()
 
 
 def tray_tip():
-    return SW.status()
+    return SW.status() + " " + VERSION
+
+
+# ---------------------------------------------------------------- обновления
+
+MB_OK, MB_YESNO, IDYES = 0x0, 0x4, 6
+MB_ICONINFO, MB_ICONQUESTION, MB_ICONWARNING = 0x40, 0x20, 0x30
+MB_SETFOREGROUND, MB_TOPMOST = 0x10000, 0x40000
+UPDATE_EVERY = 24 * 3600      # как часто проверять в фоне, сек
+UPDATE = {"busy": False, "manual": False, "info": None, "error": None, "path": None}
+
+
+def message(text, flags=MB_OK | MB_ICONINFO):
+    return user32.MessageBoxW(MAIN_HWND[0], text, core.APP_NAME,
+                              flags | MB_SETFOREGROUND | MB_TOPMOST)
+
+
+def check_updates(manual):
+    """Проверка в фоновом потоке: сеть не должна тормозить хук клавиатуры."""
+    if UPDATE["busy"]:
+        return
+    if not updater.frozen():
+        if manual:
+            message("Обновление работает только в Tilashar.exe.\n"
+                    "Скриптовую версию обновляйте через git pull.")
+        return
+    UPDATE.update(busy=True, manual=manual, info=None, error=None)
+
+    def work():
+        try:
+            UPDATE["info"] = updater.check()
+        except Exception as exc:          # нет сети, GitHub недоступен и т.п.
+            UPDATE["error"] = str(exc)
+        user32.PostMessageW(MAIN_HWND[0], WM_UPDATE, 0, 0)
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def on_update_checked():
+    info, manual = UPDATE["info"], UPDATE["manual"]
+    UPDATE["busy"] = False
+    if UPDATE["error"]:
+        if manual:
+            message("Не удалось проверить обновления:\n" + UPDATE["error"],
+                    MB_OK | MB_ICONWARNING)
+        return
+    if not info:
+        if manual:
+            message(f"У вас последняя версия ({VERSION}).")
+        return
+    if not manual and core.load_settings().get("skip_version") == info["version"]:
+        return                            # от этой версии уже отказались
+    answer = message(f"Вышла версия {info['version']} (у вас {VERSION}).\n"
+                     "Скачать и перезапустить программу?", MB_YESNO | MB_ICONQUESTION)
+    if answer != IDYES:
+        core.save_settings(skip_version=info["version"])
+        return
+    UPDATE.update(busy=True, error=None, path=None)
+
+    def work():
+        try:
+            UPDATE["path"] = updater.download(info)
+        except Exception as exc:
+            UPDATE["error"] = str(exc)
+        user32.PostMessageW(MAIN_HWND[0], WM_UPDATE_READY, 0, 0)
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def on_update_downloaded():
+    UPDATE["busy"] = False
+    if UPDATE["error"] or not UPDATE["path"]:
+        message("Не удалось скачать обновление:\n" + str(UPDATE["error"]),
+                MB_OK | MB_ICONWARNING)
+        return
+    try:
+        updater.install_and_restart(UPDATE["path"])
+    except OSError as exc:
+        message("Не удалось установить обновление:\n" + str(exc), MB_OK | MB_ICONWARNING)
+        return
+    user32.PostQuitMessage(0)
+
+
+def auto_update_loop():
+    """Фоновая проверка: через минуту после запуска и дальше раз в сутки."""
+    time.sleep(60)
+    while True:
+        if core.load_settings().get("auto_update", True) and MAIN_HWND[0]:
+            user32.PostMessageW(MAIN_HWND[0], WM_UPDATE, 1, 0)
+        time.sleep(UPDATE_EVERY)
+
+
+def toggle_auto_update():
+    core.save_settings(auto_update=not core.load_settings().get("auto_update", True))
+
+
+# ---------------------------------------------------------------- автозапуск
+# То же значение пишет установщик (галочка «Запускать при входе в Windows»).
+
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def autostart_enabled():
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            winreg.QueryValueEx(key, core.APP_NAME)
+        return True
+    except OSError:
+        return False
+
+
+def toggle_autostart():
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+        if autostart_enabled():
+            winreg.DeleteValue(key, core.APP_NAME)
+        else:
+            winreg.SetValueEx(key, core.APP_NAME, 0, winreg.REG_SZ, f'"{sys.executable}"')
+
+
+def load_tray_icon():
+    """Значок-диафрагма tilashar.ico; если файла нет - стандартный."""
+    path = os.path.join(HERE, "tilashar.ico")
+    size = user32.GetSystemMetrics(49)            # SM_CXSMICON - размер значка в трее
+    icon = user32.LoadImageW(None, path, 1, size, size, 0x10)   # IMAGE_ICON, LR_LOADFROMFILE
+    return icon or user32.LoadIconW(None, ctypes.cast(ctypes.c_void_p(IDI_APPLICATION), w.LPCWSTR))
+
+
+def close_other_copy():
+    """Закрыть уже запущенную копию (скрипт или exe), чтобы не было двух хуков."""
+    other = user32.FindWindowW("PuntoPyWnd", None)
+    if not other:
+        return
+    user32.PostMessageW(other, WM_CLOSE, 0, 0)
+    for _ in range(50):
+        time.sleep(0.1)
+        if not user32.IsWindow(other):
+            return
 
 
 def tray_update():
@@ -398,7 +604,29 @@ def show_menu(hwnd):
     user32.AppendMenuW(menu, MF_STRING | (MF_CHECKED if SW.auto else 0), ID_AUTO,
                        "Авто-режим (Ctrl+Pause)")
     user32.AppendMenuW(menu, MF_STRING | (MF_CHECKED if SW.auto_spell else 0), ID_SPELL,
-                       "Авто-орфография, только русский")
+                       "Авто-орфография")
+    sub = user32.CreatePopupMenu()
+    for taps in core.TAPS:
+        user32.AppendMenuW(sub, MF_STRING | (MF_CHECKED if SW.taps == taps else 0),
+                           ID_TAPS + taps, TAPS_NAMES[taps])
+    user32.AppendMenuW(sub, MF_SEPARATOR, 0, None)
+    for i, trig in enumerate(core.TRIGGERS):
+        if trig == "off":
+            user32.AppendMenuW(sub, MF_SEPARATOR, 0, None)
+        flags = MF_CHECKED if SW.trigger == trig else 0
+        if trig == "space" and SW.taps == 1:
+            flags |= MF_GRAYED             # одиночный пробел переводил бы каждое слово
+        user32.AppendMenuW(sub, MF_STRING | flags, ID_TRIGGER + i, TRIGGER_NAMES[trig])
+    user32.AppendMenuW(menu, MF_POPUP, sub, trigger_title())
+    user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+    auto_update = core.load_settings().get("auto_update", True)
+    user32.AppendMenuW(menu, MF_STRING | (MF_CHECKED if auto_update else 0), ID_AUTOUPDATE,
+                       "Автообновление")
+    user32.AppendMenuW(menu, MF_STRING, ID_CHECKUPDATE,
+                       f"Проверить обновления (версия {VERSION})")
+    if updater.frozen():                  # скриптовую версию ставит в автозагрузку install-windows
+        user32.AppendMenuW(menu, MF_STRING | (MF_CHECKED if autostart_enabled() else 0),
+                           ID_AUTOSTART, "Запускать вместе с Windows")
     user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
     user32.AppendMenuW(menu, MF_STRING, ID_EXIT, "Выход")
     pt = w.POINT()
@@ -423,6 +651,18 @@ def wnd_proc(hwnd, msg, wparam, lparam):
         elif wparam == HK_EXIT:
             user32.PostQuitMessage(0)
         return 0
+    if msg == WM_UPDATE:
+        if wparam:
+            check_updates(manual=False)
+        else:
+            on_update_checked()
+        return 0
+    if msg == WM_UPDATE_READY:
+        on_update_downloaded()
+        return 0
+    if msg == WM_CONVERT:
+        SW.convert_word()
+        return 0
     if msg == WM_AUTOFIX:
         time.sleep(0.05)          # даём нажатому пробелу дойти до приложения
         SW.auto_fix()
@@ -439,6 +679,19 @@ def wnd_proc(hwnd, msg, wparam, lparam):
             toggle_auto()
         elif cid == ID_SPELL:
             toggle_spell()
+        elif cid == ID_AUTOUPDATE:
+            toggle_auto_update()
+        elif cid == ID_CHECKUPDATE:
+            check_updates(manual=True)
+        elif cid == ID_AUTOSTART:
+            try:
+                toggle_autostart()
+            except OSError as exc:
+                message("Не удалось изменить автозапуск:\n" + str(exc), MB_OK | MB_ICONWARNING)
+        elif cid - ID_TAPS in core.TAPS:
+            SW.set_taps(cid - ID_TAPS)
+        elif ID_TRIGGER <= cid < ID_TRIGGER + len(core.TRIGGERS):
+            SW.set_trigger(core.TRIGGERS[cid - ID_TRIGGER])
         elif cid == ID_EXIT:
             user32.PostQuitMessage(0)
         return 0
@@ -454,6 +707,9 @@ def main():
         return 1
 
     hinst = kernel32.GetModuleHandleW(None)
+    close_other_copy()
+    updater.cleanup()
+
     cls = WNDCLASS()
     cls.lpfnWndProc = wnd_proc
     cls.hInstance = hinst
@@ -461,19 +717,24 @@ def main():
     if not user32.RegisterClassW(ctypes.byref(cls)):
         print("RegisterClass failed:", ctypes.get_last_error())
         return 1
-    hwnd = user32.CreateWindowExW(0, "PuntoPyWnd", "PuntoPy", 0, 0, 0, 0, 0,
+    hwnd = user32.CreateWindowExW(0, "PuntoPyWnd", core.APP_NAME, 0, 0, 0, 0, 0,
                                   None, None, hinst, None)
 
     MAIN_HWND[0] = hwnd
-    SW.auto = "--auto" in sys.argv        # сразу в авто-режиме
-    SW.auto_spell = "--spell" in sys.argv
+    settings = core.load_settings()
+    # ключи запуска включают режимы; без них - как было в прошлый раз
+    SW.auto = "--auto" in sys.argv or bool(settings.get("auto"))
+    SW.auto_spell = "--spell" in sys.argv or bool(settings.get("spell"))
+    SW.apply_settings(settings, DEFAULT_TRIGGER)
+    if "--no-double-space" in sys.argv:
+        SW.trigger = "off"
 
     nid.cbSize = ctypes.sizeof(NOTIFYICONDATA)
     nid.hWnd = hwnd
     nid.uID = 1
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
     nid.uCallbackMessage = WM_TRAY
-    nid.hIcon = user32.LoadIconW(None, ctypes.cast(ctypes.c_void_p(IDI_APPLICATION), w.LPCWSTR))
+    nid.hIcon = load_tray_icon()
     nid.szTip = tray_tip()
     shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid))
 
@@ -492,6 +753,8 @@ def main():
     print("Запущено. Pause - раскладка слова, Shift+Pause - выделенное, "
           "Ctrl+Alt+Pause - орфография слова, Ctrl+Pause - авто-режим, "
           "Ctrl+Shift+Pause - выход.")
+
+    threading.Thread(target=auto_update_loop, daemon=True).start()
 
     msg = w.MSG()
     while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:

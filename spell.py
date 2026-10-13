@@ -8,10 +8,9 @@
 """
 
 import io
-import os
 import re
 
-from layouts import HERE,  CYRILLIC, LATIN, DICT, KNOWN, RANK, NEVER, NEVER_STEMS
+from layouts import CYRILLIC, LATIN, DICT, KNOWN, RANK, NEVER, NEVER_STEMS, user_file
 
 RU_ALPHABET = "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
 EN_ALPHABET = "abcdefghijklmnopqrstuvwxyz"
@@ -38,7 +37,7 @@ _HAS_DIGIT = re.compile(r"\d")
 def _load_replacements():
     """Таблица автозамен из replace.txt: {что: на что}."""
     out = {}
-    path = os.path.join(HERE, "replace.txt")
+    path = user_file("replace.txt")
     try:
         for line in io.open(path, encoding="utf-8"):
             line = line.split("#")[0].strip()
@@ -168,7 +167,34 @@ def suggest(word, strict=False):
         best = rare[0]
     if strict and (len(low) < AUTO_MIN_LEN or edit_kind(low, best) not in AUTO_KINDS):
         return None
+    if strict and lang == "en" and not _en_auto_ok(core, low, best, ranks):
+        return None
     return _match_case(core, best)
+
+
+def _en_auto_ok(core, low, best, ranks):
+    """Доп. фильтр авто-режима для английского: там полно терминов и имён.
+
+    Правка должна быть внутри слова: опечатки почти не задевают первую букву,
+    а на краях живут термины (stdio->studio, endian->indian, clientid->cliented).
+    """
+    if core[:1].isupper():                     # Marvell, Nagle - имена
+        return False
+    if best not in ranks:                      # minmax->minimax, callgraph->calligraph
+        return False
+    pre = 0
+    while pre < min(len(low), len(best)) and low[pre] == best[pre]:
+        pre += 1
+    suf = 0
+    while (suf < min(len(low), len(best)) - pre
+           and low[-1 - suf] == best[-1 - suf]):
+        suf += 1
+    if pre < 1:
+        return False
+    if pre < 2 and edit_kind(low, best) == "double":   # sstream, fflush, ccomplex
+        return False
+    # перестановка в конце - частая опечатка (lenght, macth); прочее - нет
+    return suf >= 2 or edit_kind(low, best) == "transpose"
 
 
 def _match_case(src, dst):

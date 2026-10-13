@@ -292,3 +292,6 @@ proto
 непросроч
 неуспешн
 недостиж
+stdio
+huart
+mosquitto

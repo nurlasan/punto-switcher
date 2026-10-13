@@ -101,6 +101,126 @@ def main():
     typed(sw, "батч бэкенд привет ")
     check("своё не тронуто", be.text, "")
 
+    print("Короткие слова")
+    check("предлог сам по себе", core.short_wrong("yf"), True)
+    check("одна буква без соседей", core.short_wrong("d"), False)
+    check("одна буква после русского", core.short_wrong("d", True), True)
+    check("английский предлог", core.short_wrong("шт"), True)
+    check("vs не трогаем", core.short_wrong("vs"), False)
+    check("английское in не трогаем", core.short_wrong("in"), False)
+
+    for name, text, want in (
+            ("предлог на лету", "yf ", "на "),
+            ("местоимение на лету", "jy ", "он "),
+            ("предлог перед словом", "d ujhjl ", "в город "),
+            ("цепочка коротких", "z e nt,z ", "я у тебя "),
+            ("буква после русского", "иду d ", "иду в "),
+            ("английские короткие", "шы ше ", "is it "),
+            ("английский текст цел", "plan b vs it in ", "plan b vs it in ")):
+        be = FakeBackend()
+        be.text = ""
+        sw = core.Switcher(be)
+        sw.auto = sw.auto_spell = True
+        for ch in text:
+            be.text += ch
+            if sw.on_char(ch):
+                sw.auto_fix()
+        check(name, be.text, want)
+
+    print("Двойной пробел")
+    for name, text, auto, want in (
+            ("слово без авто-режима", "ghbdtn  ", False, "привет "),
+            ("буква", "d  ", False, "в "),
+            ("английское слово", "руддщ  ", False, "hello "),
+            ("откат авто-перевода", "ghbdtn  ", True, "ghbdtn "),
+            ("один пробел - ничего", "ghbdtn ", False, "ghbdtn "),
+            ("отступ не трогаем", "  ", False, "  ")):
+        be = FakeBackend()
+        sw = core.Switcher(be)
+        sw.auto = sw.auto_spell = auto
+        for ch in text:
+            be.text += ch
+            if sw.on_char(ch):
+                sw.auto_fix()
+        check(name, be.text, want)
+
+    be = FakeBackend()
+    sw = core.Switcher(be)
+    for ch in "ghbdtn ":
+        be.text += ch
+        sw.on_char(ch)
+    sw.last_space -= 1                 # второй пробел через секунду
+    be.text += " "
+    if sw.on_char(" "):
+        sw.auto_fix()
+    check("медленный двойной пробел", be.text, "ghbdtn  ")
+
+    print("Двойной Ctrl / Alt / Shift")
+    sw = core.Switcher(FakeBackend())
+    sw.trigger = "ctrl"
+    check("одно нажатие", sw.on_modifier("ctrl"), False)
+    check("второе нажатие", sw.on_modifier("ctrl"), True)
+    check("третье - снова с нуля", sw.on_modifier("ctrl"), False)
+    sw.on_char("a")
+    check("буква между нажатиями", sw.on_modifier("ctrl"), False)
+    sw.on_modifier(None)               # Ctrl+Shift и т.п.
+    check("сочетание между нажатиями", sw.on_modifier("ctrl"), False)
+    sw.reset()
+    check("не тот модификатор", (sw.on_modifier("alt"), sw.on_modifier("alt")), (False, False))
+    sw.on_modifier("ctrl")
+    sw.last_tap = ("ctrl", sw.last_tap[1] - 1)
+    check("медленно", sw.on_modifier("ctrl"), False)
+
+    be = FakeBackend()
+    sw = core.Switcher(be)
+    sw.trigger = "ctrl"
+    for ch in "ghbdtn  ":
+        be.text += ch
+        if sw.on_char(ch):
+            sw.auto_fix()
+    check("пробел не срабатывает при Ctrl", be.text, "ghbdtn  ")
+    sw.on_modifier("ctrl")
+    if sw.on_modifier("ctrl"):
+        sw.convert_word()
+    check("двойной Ctrl переводит", be.text, "привет  ")
+
+    print("Одно нажатие")
+    saved, core.save_settings = core.save_settings, lambda **kw: None   # не трогать settings.json
+    try:
+        sw = core.Switcher(FakeBackend())
+        sw.trigger = "space"
+        sw.set_taps(1)
+        check("пробел при 1 нажатии -> Ctrl", (sw.taps, sw.trigger), (1, "ctrl"))
+        sw.set_trigger("space")
+        check("одиночный пробел не выбрать", sw.trigger, "ctrl")
+        check("нажали - ещё рано", sw.on_modifier("ctrl"), False)
+        check("отпустили - переводим", sw.on_modifier_up("ctrl"), True)
+        sw.on_modifier("ctrl")
+        sw.on_char("c")                    # Ctrl+C
+        check("Ctrl+C не срабатывает", sw.on_modifier_up("ctrl"), False)
+        sw.on_modifier("ctrl")
+        sw.on_modifier(None)               # Ctrl+Shift
+        check("Ctrl+Shift не срабатывает", sw.on_modifier_up("ctrl"), False)
+        sw.on_modifier("ctrl")
+        sw.tap_down = ("ctrl", sw.tap_down[1] - 1)
+        check("долго держали", sw.on_modifier_up("ctrl"), False)
+        check("чужой модификатор", (sw.on_modifier("alt"), sw.on_modifier_up("alt")), (False, False))
+        sw.set_taps(2)
+        sw.on_modifier("ctrl")
+        check("при 2 нажатиях отпускание не считается", sw.on_modifier_up("ctrl"), False)
+        sw.apply_settings({"taps": 1, "trigger": "space"}, "ctrl")
+        check("мусор в настройках", (sw.taps, sw.trigger), (1, "ctrl"))
+    finally:
+        core.save_settings = saved
+
+    print("Английская авто-орфография")
+    for bad, good in (("seperate", "separate"), ("lenght", "length"),
+                      ("managment", "management"), ("occured", "occurred"),
+                      ("dont", "don't"), ("accross", "across")):
+        check(bad, spell.suggest(bad, strict=True), good)
+    for word in ("stdio", "endian", "clientid", "sstream", "Marvell", "minmax"):
+        check(f"{word} не трогаем", spell.suggest(word, strict=True), None)
+
     print("Ручные команды")
     be = FakeBackend()
     sw = core.Switcher(be)

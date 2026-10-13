@@ -6,7 +6,8 @@
 через Text Input Sources и значок в строке меню.
 
 Горячие клавиши (по умолчанию):
-    двойной Shift      - перевести последнее слово в другую раскладку
+    двойной пробел     - перевести последнее слово в другую раскладку
+                         (в меню можно выбрать двойной ⌃, ⌥ или Shift)
     ⌃⌥L                - то же самое
     ⌃⌥⇧L               - перевести выделенный текст
     ⌃⌥S                - исправить опечатку в последнем слове
@@ -48,7 +49,10 @@ MODIFIERS = MASK_SHIFT | MASK_CONTROL | MASK_OPTION | MASK_COMMAND
 # клавиши, которые рвут слово: Enter, Tab, Esc, стрелки, Home/End/PgUp/PgDn
 RESET_KEYS = {36, 76, 48, 53, 123, 124, 125, 126, 115, 116, 119, 121, 117}
 
-DOUBLE_SHIFT_GAP = 0.35        # за столько секунд надо успеть нажать Shift дважды
+# keycode модификатора -> (имя для core, его флаг)
+MOD_KEYS = {56: ("shift", MASK_SHIFT), 60: ("shift", MASK_SHIFT),
+            59: ("ctrl", MASK_CONTROL), 62: ("ctrl", MASK_CONTROL),
+            58: ("alt", MASK_OPTION), 61: ("alt", MASK_OPTION)}
 
 RU_SOURCE = "com.apple.keylayout.Russian"
 EN_SOURCE = "com.apple.keylayout.US"
@@ -219,26 +223,29 @@ SW = core.Switcher(MacBackend())
 
 
 class Hotkeys:
-    """Разбор горячих клавиш, включая двойное нажатие Shift."""
+    """Разбор горячих клавиш, включая двойное нажатие модификатора."""
 
     def __init__(self, switcher, menu=None):
         self.sw = switcher
         self.menu = menu
-        self.last_shift = 0.0
 
     def refresh(self):
         if self.menu:
             self.menu.refresh()
 
     def on_flags_changed(self, event):
-        """Двойной Shift подряд - перевести последнее слово."""
-        flags = Quartz.CGEventGetFlags(event)
-        if not flags & MASK_SHIFT or flags & (MASK_CONTROL | MASK_OPTION | MASK_COMMAND):
+        """Двойное нажатие выбранного модификатора - перевести последнее слово."""
+        flags = Quartz.CGEventGetFlags(event) & MODIFIERS
+        keycode = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
+        name, mask = MOD_KEYS.get(keycode, (None, 0))
+        if name and not flags & mask:     # отпускание - для одиночного нажатия
+            if self.sw.on_modifier_up(name):
+                AppHelper.callLater(0.01, self.sw.convert_word)
             return False
-        now = time.time()
-        double = now - self.last_shift <= DOUBLE_SHIFT_GAP
-        self.last_shift = 0.0 if double else now
-        if double:
+        if not name:
+            return False
+        # нажат один этот модификатор; в сочетании с другими - сброс
+        if self.sw.on_modifier(name if flags == mask else None):
             AppHelper.callLater(0.01, self.sw.convert_word)
         return False          # событие пропускаем дальше в любом случае
 
@@ -334,6 +341,11 @@ TAP = [None]
 # --------------------------------------------------------- значок в меню
 
 
+TRIGGER_NAMES = {"ctrl": "⌃ Control", "alt": "⌥ Option", "shift": "⇧ Shift",
+                 "space": "Пробел", "off": "Выключено"}
+TAPS_NAMES = {1: "1 - одно нажатие", 2: "2 - два нажатия"}
+
+
 class MenuDelegate(AppKit.NSObject):
     """Значок в строке меню: состояние и переключатели."""
 
@@ -347,9 +359,30 @@ class MenuDelegate(AppKit.NSObject):
         self.menu = AppKit.NSMenu.alloc().init()
 
         self.auto_item = self._add("Авто-раскладка (⌃⌥A)", "toggleAuto:")
-        self.spell_item = self._add("Авто-орфография, только русский (⌃⌥P)", "toggleSpell:")
+        self.spell_item = self._add("Авто-орфография (⌃⌥P)", "toggleSpell:")
         self.menu.addItem_(AppKit.NSMenuItem.separatorItem())
-        self._add("Слово в другую раскладку (двойной Shift)", "convertWord:")
+        self.trigger_root = self._add("Перевод слова", None)
+        self.trigger_menu = AppKit.NSMenu.alloc().init()
+        self.trigger_items = []
+        self.taps_items = []
+        for taps in core.TAPS:
+            item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                TAPS_NAMES[taps], "setTaps:", "")
+            item.setTarget_(self)
+            item.setTag_(taps)
+            self.trigger_menu.addItem_(item)
+            self.taps_items.append(item)
+        self.trigger_menu.addItem_(AppKit.NSMenuItem.separatorItem())
+        self.trigger_menu.setAutoenablesItems_(False)
+        for i, trig in enumerate(core.TRIGGERS):
+            item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                TRIGGER_NAMES[trig], "setTrigger:", "")
+            item.setTarget_(self)
+            item.setTag_(i)
+            self.trigger_menu.addItem_(item)
+            self.trigger_items.append(item)
+        self.trigger_root.setSubmenu_(self.trigger_menu)
+        self._add("Слово в другую раскладку (⌃⌥L)", "convertWord:")
         self._add("Выделенное в другую раскладку (⌃⌥⇧L)", "convertSelection:")
         self._add("Исправить опечатку (⌃⌥S)", "spellWord:")
         self.menu.addItem_(AppKit.NSMenuItem.separatorItem())
@@ -369,6 +402,16 @@ class MenuDelegate(AppKit.NSObject):
     def refresh(self):
         self.auto_item.setState_(1 if self.sw.auto else 0)
         self.spell_item.setState_(1 if self.sw.auto_spell else 0)
+        for trig, item in zip(core.TRIGGERS, self.trigger_items):
+            item.setState_(1 if self.sw.trigger == trig else 0)
+            item.setEnabled_(not (trig == "space" and self.sw.taps == 1))
+        for taps, item in zip(core.TAPS, self.taps_items):
+            item.setState_(1 if self.sw.taps == taps else 0)
+        if self.sw.trigger == "off":
+            self.trigger_root.setTitle_("Перевод слова: выключен")
+        else:
+            self.trigger_root.setTitle_(
+                f"Перевод слова: {self.sw.taps}× {TRIGGER_NAMES[self.sw.trigger]}")
         title = "ПА" if self.sw.auto else "П"
         self.item.button().setTitle_(title)
         self.item.button().setToolTip_(self.sw.status())
@@ -379,6 +422,14 @@ class MenuDelegate(AppKit.NSObject):
 
     def toggleSpell_(self, sender):
         self.sw.toggle_spell()
+        self.refresh()
+
+    def setTaps_(self, sender):
+        self.sw.set_taps(sender.tag())
+        self.refresh()
+
+    def setTrigger_(self, sender):
+        self.sw.set_trigger(core.TRIGGERS[sender.tag()])
         self.refresh()
 
     def convertWord_(self, sender):
@@ -449,6 +500,9 @@ def main(argv):
 
     SW.auto = "--auto" in argv
     SW.auto_spell = "--spell" in argv
+    SW.apply_settings(core.load_settings(), "space")
+    if "--no-double-space" in argv:
+        SW.trigger = "off"
 
     app = AppKit.NSApplication.sharedApplication()
     app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
@@ -469,7 +523,7 @@ def main(argv):
                               Quartz.kCFRunLoopCommonModes)
     Quartz.CGEventTapEnable(tap, True)
 
-    print("Запущено. Двойной Shift - раскладка слова, ⌃⌥⇧L - выделенное, "
+    print("Запущено. Двойной пробел (см. меню) - раскладка слова, ⌃⌥⇧L - выделенное, "
           "⌃⌥S - орфография, ⌃⌥A - авто-режим, ⌃⌥Q - выход.")
     AppHelper.runEventLoop()
     return 0

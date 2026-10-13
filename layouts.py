@@ -9,6 +9,8 @@
 import json
 import math
 import os
+import shutil
+import sys
 
 from wordset import WordSet
 
@@ -30,7 +32,29 @@ EN2RU = {e: r for r, e in zip(_RU, _EN)}
 CYRILLIC = set("абвгдеёжзийклмнопрстуфхцчшщъыьэюяАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ")
 LATIN = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+APP_NAME = "Tilashar"
+
+# HERE - словари и модель (только чтение); USER_DIR - то, что человек правит
+# сам и что должно пережить обновление: dict_user.txt, replace.txt, settings.json.
+# В exe (PyInstaller) словари лежат во временной папке распаковки, поэтому
+# личные файлы живут в %APPDATA%\Tilashar; при запуске скриптом - рядом с ними.
+if getattr(sys, "frozen", False):
+    HERE = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    USER_DIR = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), APP_NAME)
+else:
+    HERE = USER_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def user_file(name):
+    """Путь к личному файлу; при первом запуске exe копирует туда исходный."""
+    path = os.path.join(USER_DIR, name)
+    if not os.path.exists(path) and USER_DIR != HERE:
+        try:
+            os.makedirs(USER_DIR, exist_ok=True)
+            shutil.copyfile(os.path.join(HERE, name), path)
+        except OSError:
+            pass
+    return path
 
 
 def detect_direction(text):
@@ -48,9 +72,9 @@ def convert(text):
 
 # ------------------------------------------------------------ модель языка
 
-def _load_dict(name):
+def _load_dict(path):
     try:
-        with open(os.path.join(HERE, name), encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             return {line.strip() for line in f if line.strip()}
     except OSError:
         return set()
@@ -76,7 +100,7 @@ def _load_model():
 RANK = {"ru": _load_ranked("dict_ru.txt"), "en": _load_ranked("dict_en.txt")}
 DICT = {lang: set(ranks) for lang, ranks in RANK.items()}
 # слова, которые никогда не трогать (свои термины, имена, аббревиатуры)
-NEVER = {word.lower() for word in _load_dict("dict_user.txt")}
+NEVER = {word.lower() for word in _load_dict(user_file("dict_user.txt"))}
 # корни стоп-слов: от них отсекаются и словоформы (баг -> багов, деплой -> деплою)
 NEVER_STEMS = {word for word in NEVER if len(word) >= 4}
 # большие словари словоформ (на диске, ищутся бинарным поиском)
@@ -159,6 +183,46 @@ def looks_wrong(word):
         return False
 
     return logprob(lo, alt_lang) - logprob(lw, cur_lang) >= THRESHOLD
+
+
+# Короткие служебные слова: предлоги, союзы, местоимения. Словарю и модели
+# на 1-2 буквах верить нельзя, поэтому решаем по явным спискам.
+SHORT = {
+    "ru": {"в", "к", "с", "у", "о", "а", "и", "я",
+           "не", "на", "но", "за", "по", "до", "из", "от", "об", "во", "ко",
+           "со", "он", "мы", "ты", "вы", "их", "её", "ее", "ей", "им", "ли",
+           "же", "бы", "да", "ну", "то", "уж", "ни", "ой"},
+    "en": {"a", "i", "in", "to", "is", "on", "at", "of", "it", "my", "we",
+           "he", "me", "be", "do", "go", "so", "no", "up", "us", "or", "an",
+           "as", "by", "if", "am", "ok"},
+}
+# короткие слова, которые в другом языке сами что-то значат
+# (vs, kb, ns - термины; ща, гы - сленг); их меняем только по соседям
+SHORT_AMBIGUOUS = {"vs", "kb", "ns", "ds", "lf", "tt", "ye", "bv", "nj", "cj",
+                   "rj", "pf", "jq", "dj", "bp", "yt", "lj",
+                   "ща", "гы", "ин", "фе"}
+
+
+def short_wrong(word, context=False):
+    """True, если короткое слово (1-2 символа) набрано не в той раскладке.
+
+    context=True - предыдущее слово набрано на другом языке, это повод
+    поменять и неоднозначные слова (одиночные буквы, vs, kb).
+    """
+    if not word or len(word) > 2:
+        return False
+    low = word.lower()
+    if low in NEVER or (len(word) == 2 and word.isupper()):   # PF, BP - аббревиатуры
+        return False
+    other = convert(word).lower()
+    alt, cur = ("en", "ru") if detect_direction(word) == "ru2en" else ("ru", "en")
+    if other not in SHORT[alt] or low in SHORT[cur]:
+        return False
+    # одиночные латинские буквы (c, b, e) бывают пунктами и переменными;
+    # одиночные «ш», «ф» по-русски не значат ничего
+    if low in SHORT_AMBIGUOUS or (len(word) == 1 and cur == "en"):
+        return context
+    return True
 
 
 def _fallback(word, other, cur_lang):
